@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Мой архив ВК</title>
+  <link rel="stylesheet" href="/app.css">
+  <script src="/app.js" nonce="__NONCE__" defer></script>
+</head>
+<body>
+  <header class="topbar">
+    <a class="brand" href="#profile" aria-label="Открыть профиль">
+      <span class="brand-mark" aria-hidden="true">VK</span>
+      <span>Мой архив</span>
+    </a>
+    <span class="local-badge">Локальная копия</span>
+    <div class="topbar-status">
+      <span class="status-dot" id="status-dot" aria-hidden="true"></span>
+      <span id="progress" role="status" aria-live="polite">Открытие архива…</span>
+    </div>
+    <button class="button button-quiet refresh-button" id="refresh" type="button">Обновить</button>
+  </header>
+  <div class="app-layout">
+    <aside class="sidebar">
+      <nav id="navigation" aria-label="Разделы архива"></nav>
+      <div class="sidebar-note">Данные хранятся на этом компьютере.</div>
+    </aside>
+    <main id="main" tabindex="-1" aria-busy="true"></main>
+  </div>
+  <noscript><p class="noscript">Для просмотра локального архива включите JavaScript в браузере.</p></noscript>
+</body>
+</html>

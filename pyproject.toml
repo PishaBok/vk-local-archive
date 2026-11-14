@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "vk-local-archive"
+version = "2.0.0"
+description = "A local VK data exporter with readable media folders and a separate offline viewer"
+readme = "README.md"
+requires-python = ">=3.9"
+license = "MIT"
+license-files = ["LICENSE"]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Operating System :: Microsoft :: Windows",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Topic :: Communications :: Chat",
+]
+dependencies = []
+
+[project.optional-dependencies]
+video = ["yt-dlp; python_version >= '3.11'"]
+
+[project.scripts]
+vk-archive-download = "vk_archive.download_cli:main"
+vk-archive-view = "vk_archive.view_cli:main"
+
+[tool.setuptools.packages.find]
+include = ["vk_archive*"]
+
+[tool.setuptools.package-data]
+vk_archive = ["web/*.html", "web/*.css", "web/*.js"]
