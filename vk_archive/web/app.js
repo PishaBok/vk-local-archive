@@ -9,7 +9,8 @@
     ["group", "Сообщества", "groups"],
     ["photo", "Фото", "photo"],
     ["audio", "Музыка", "music"],
-    ["video", "Видео", "video"],
+    ["video", "Мои видео", "video"],
+    ["dialog_video", "Видео из диалогов", "video"],
     ["album", "Альбомы", "album"],
     ["separator"],
     ["bookmark", "Закладки", "bookmark"],
@@ -160,7 +161,8 @@
   function routeURL(value) {
     const params = new URLSearchParams();
     for (const key of ["peer", "parent", "offset", "q", "year"]) if (value[key]) params.set(key, value[key]);
-    return "#" + value.view + (params.size ? "?" + params.toString() : "");
+    const search = params.toString();
+    return "#" + value.view + (search ? "?" + search : "");
   }
 
   function navigate(view, values = {}) {
@@ -192,7 +194,7 @@
       sizes.sort((a, b) => (Number(b.width) || 0) * (Number(b.height) || 0) - (Number(a.width) || 0) * (Number(a.height) || 0));
       return sizes[0].url || sizes[0].src;
     }
-    for (const key of ["photo_max_orig", "photo_200_orig", "photo_200", "photo_100", "photo_50", "thumb_256", "thumb_96", "thumb_48", "cover_src_big", "cover_src"]) if (typeof value[key] === "string") return value[key];
+    for (const key of ["photo_max_orig", "photo_200_orig", "photo_200", "photo_100", "photo_50", "thumb_256", "thumb_96", "thumb_48", "cover_src_big", "cover_src", "thumb_src"]) if (typeof value[key] === "string" && value[key]) return value[key];
     return "";
   }
 
@@ -274,7 +276,8 @@
   function mediaState(asset) {
     if (!asset) return "Файл не сохранён. Подробности о выгрузке — в отчёте.";
     if (asset.status === "pending" || asset.status === "downloading" || asset.status === "queued") return "Файл ещё загружается.";
-    return asset.error || (asset.status === "done" ? "Локальный файл не найден." : "Файл недоступен для сохранения.");
+    if (asset.status === "done" || asset.status === "partial") return "Локальный файл не найден.";
+    return asset.error || "Файл недоступен для сохранения.";
   }
 
   function downloadLink(asset, name = "Скачать файл") {
@@ -292,12 +295,16 @@
     const url = localURL(asset && asset.local);
     const title = value.title || (kind === "voice" ? "Голосовое сообщение" : kind === "video" ? "Видео" : kind === "audio" ? "Аудиозапись" : kind === "doc" ? "Документ" : "");
     if (kind === "doc") {
-      const card = node("div", "document");
+      const card = node(url ? "a" : "div", url ? "document document-link" : "document");
+      if (url) {
+        card.href = url;
+        card.download = asset.name || title;
+      }
       append(card, node("span", "document-icon", value.ext || "файл"));
       const body = node("div", "grow");
       append(body, node("div", "document-name", title), textBlock(bytes(asset && asset.size || value.size), "document-info"));
-      if (url) body.append(downloadLink(asset, "Открыть / скачать"));
-      else body.append(node("p", "document-info", mediaState(asset)));
+      if (url) body.append(node("span", "attachment-download", "Скачать документ"));
+      else append(body, node("p", "document-info", "Нет локальной копии"), node("p", "document-info", mediaState(asset)));
       append(card, body);
       append(container, card, fileLocation(asset));
       return container;
@@ -317,14 +324,17 @@
     } else if (url && ["video", "audio", "voice"].includes(kind)) {
       const player = node(kind === "video" ? "video" : "audio");
       player.controls = true;
-      player.preload = "metadata";
+      player.preload = "none";
+      const error = node("p", "notice neutral", "Не удалось воспроизвести файл в браузере. Скачайте его, чтобы открыть в плеере.");
+      error.hidden = true;
+      player.addEventListener("error", () => { error.hidden = false; }, { once: true });
       player.src = url;
       if (kind === "video") {
         const thumb = assets.get(mediaReference("video_thumb", value)) || assetsByURL.get(pictureURL({ images: value.image || [] }));
         const poster = localURL(thumb && thumb.local);
         if (poster) player.poster = poster;
       }
-      append(container, player, downloadLink(asset));
+      append(container, player, downloadLink(asset), error);
       player.append(node("p", "muted", "Браузер не поддерживает этот формат. Скачайте сохранённый файл."));
     } else {
       if (kind === "video") {
@@ -416,6 +426,7 @@
     if (!depth) container.append(avatar(message.from_id));
     if (label) body.append(node("span", "quote-label", label));
     const meta = node("div", "message-meta");
+    if (depth && message.from_id) meta.append(avatar(message.from_id, { size: "quoted" }));
     append(meta, node("span", "message-name", actorName(message.from_id)), node("time", "message-time", date(message.date)));
     append(body, meta, textBlock(message.text, "text message-text"));
     if (message.action) body.append(node("div", "event", actionText(message.action, message.from_id)));
@@ -556,6 +567,17 @@
     return card;
   }
 
+  async function loadSection(path, signal, label = "Открытие раздела…") {
+    const loading = append(node("div", "card loading"), node("span", "spinner"), node("span", "", label));
+    loading.setAttribute("role", "status");
+    main.append(loading);
+    try {
+      return await api(path, signal);
+    } finally {
+      loading.remove();
+    }
+  }
+
   function searchToolbar(chat = false) {
     const form = node("form", "toolbar");
     const query = node("input", "search-field");
@@ -570,18 +592,25 @@
       year.type = "number";
       year.min = "2006";
       year.max = "2100";
-      year.placeholder = "Год";
+      year.placeholder = "Все годы";
       year.setAttribute("aria-label", "Год сообщений");
       year.value = route.year;
       form.append(year);
     }
-    const submit = node("button", "button button-quiet", "Найти");
-    submit.type = "submit";
-    form.append(submit);
+    const submitSearch = () => {
+      if (!form.reportValidity()) return;
+      updateRoute({ q: query.value.trim(), year: year ? year.value : "", offset: 0 });
+    };
+    form.append(button("Найти", submitSearch, "button button-quiet"));
     if (route.q || route.year) form.append(button("Сбросить", () => updateRoute({ q: "", year: "", offset: 0 }), "button button-quiet"));
     form.addEventListener("submit", event => {
       event.preventDefault();
-      updateRoute({ q: query.value, year: year ? year.value : "", offset: 0 });
+      submitSearch();
+    });
+    form.addEventListener("keydown", event => {
+      if (event.key !== "Enter" || event.isComposing || (event.target !== query && event.target !== year)) return;
+      event.preventDefault();
+      submitSearch();
     });
     return form;
   }
@@ -621,7 +650,7 @@
   }
 
   async function profilePage(signal, current) {
-    const response = await api("profile", signal);
+    const response = await loadSection("profile", signal);
     if (!current()) return;
     const profile = unwrap((response.items || [])[0]) || {};
     if (!profile.id) {
@@ -721,7 +750,7 @@
 
   async function conversationsPage(signal, current) {
     main.append(pageHeading("Мессенджер", "Сохранённая история личных диалогов и бесед"), searchToolbar());
-    const data = await api(objectQuery("conversation", { offset: route.offset, limit: PAGE_SIZE, q: route.q }), signal);
+    const data = await loadSection(objectQuery("conversation", { offset: route.offset, limit: PAGE_SIZE, q: route.q }), signal);
     if (!current()) return;
     const list = node("div", "card dialog-list");
     for (const row of data.items || []) {
@@ -755,12 +784,19 @@
       query.after = Math.floor(new Date(year, 0, 1).getTime() / 1000);
       query.before = Math.floor(new Date(year + 1, 0, 1).getTime() / 1000);
     }
-    const data = await api(objectQuery("message", query), signal);
+    const filtered = Boolean(route.q || route.year);
+    const data = await loadSection(objectQuery("message", query), signal, filtered ? "Поиск сообщений…" : "Открытие истории…");
     if (!current()) return;
     const list = node("div", "card message-list");
     for (const row of data.items || []) list.append(renderMessage(unwrap(row)));
-    if (list.childElementCount) main.append(list, pager(data.total || 0, (data.items || []).length));
-    else main.append(emptyState("Сообщения не найдены", route.q || route.year ? "Измените поисковый запрос или год." : "История этого диалога не получена. Проверьте отчёт.", "messages"));
+    if (list.childElementCount) {
+      if (filtered) main.append(node("p", "search-result-count", "Найдено сообщений: " + Number(data.total || 0).toLocaleString("ru-RU")));
+      main.append(list, pager(data.total || 0, (data.items || []).length));
+    } else if (filtered) {
+      main.append(append(node("div", "card empty-state"), node("h2", "", "Сообщения не найдены"), node("p", "", "Измените запрос или снимите фильтр по году."), button("Сбросить поиск", () => updateRoute({ q: "", year: "", offset: 0 }), "button button-quiet")));
+    } else {
+      main.append(emptyState("История не сохранена", "Если загрузка уже завершилась, проверьте отчёт.", "messages"));
+    }
   }
 
   async function collectionPage(signal, current) {
@@ -768,14 +804,18 @@
     if (albumView) main.append(button("← Все альбомы", () => navigate("album"), "button button-quiet button-small"));
     main.append(pageHeading(albumView ? "Фотографии альбома" : LABELS[route.view]), searchToolbar());
     if (route.view === "audio") main.append(node("p", "notice neutral", "Здесь показаны аудиозаписи, метаданные которых сохранены в архиве. Возможность выгрузки музыкальной коллекции и файлов зависит от доступа API."));
-    const data = await api(objectQuery(route.view, { offset: route.offset, limit: PAGE_SIZE, q: route.q, parent: route.parent }), signal);
+    const kind = route.view === "dialog_video" ? "video" : route.view;
+    const query = { offset: route.offset, limit: PAGE_SIZE, q: route.q, parent: route.parent };
+    if (route.view === "video") query.parent = "own";
+    if (route.view === "dialog_video") query.source = "dialogs";
+    const data = await loadSection(objectQuery(kind, query), signal);
     if (!current()) return;
     if (!(data.items || []).length) {
       main.append(emptyState(route.q ? "Ничего не найдено" : "Данные ещё не сохранены", route.q ? "Попробуйте другой поисковый запрос." : "Состояние раздела и причины пропусков можно посмотреть в отчёте.", (NAVIGATION.find(item => item[0] === route.view) || ["", "", "document"])[2]));
       return;
     }
     const grid = node("div", route.view === "bookmark" ? "" : "collection-grid");
-    for (const row of data.items || []) grid.append(collectionCard(route.view, unwrap(row)));
+    for (const row of data.items || []) grid.append(collectionCard(kind, unwrap(row)));
     main.append(grid, pager(data.total || 0, data.items.length));
   }
 
@@ -796,7 +836,7 @@
   }
 
   async function reportPage(signal, current) {
-    const data = await api("status", signal);
+    const data = await loadSection("status", signal);
     if (!current()) return;
     main.append(pageHeading("Отчёт о выгрузке", "Полученные разделы, сохранённые файлы и причины пропусков"));
     const counters = data.assets && !Array.isArray(data.assets) ? data.assets : {};
@@ -840,12 +880,8 @@
     rendering = true;
     main.setAttribute("aria-busy", "true");
     refreshButton.disabled = true;
-    main.replaceChildren(append(node("div", "card loading"), node("span", "spinner"), node("span", "", "Открытие раздела…")));
+    main.replaceChildren();
     updateNavigation();
-    let cleared = false;
-    const clearLoading = () => { if (!cleared && current()) { main.replaceChildren(); cleared = true; } };
-    // Убираем индикатор до первого рендера, ответы остаются защищены номером запроса.
-    clearLoading();
     try {
       if (route.view === "profile") await profilePage(signal, current);
       else if (route.view === "report") await reportPage(signal, current);
@@ -868,12 +904,14 @@
 
   function updateNavigation() {
     for (const element of navigation.querySelectorAll("button[data-view]")) {
-      const active = element.dataset.view === route.view;
+      const view = element.dataset.view;
+      const active = view === route.view;
       element.classList.toggle("active", active);
       if (active) element.setAttribute("aria-current", "page");
       else element.removeAttribute("aria-current");
       const counter = element.querySelector(".count");
-      const value = latestStatus && latestStatus.counts && latestStatus.counts[element.dataset.view];
+      const counts = view === "video" || view === "dialog_video" ? latestStatus?.video_counts : latestStatus?.counts;
+      const value = counts?.[view];
       if (counter) counter.textContent = value ? Number(value).toLocaleString("ru-RU") : "";
     }
   }
@@ -902,7 +940,7 @@
       progress.textContent = label + (total ? " · вложений " + (counters.done || 0) + " / " + total : "");
       progress.title = progress.textContent;
       updateNavigation();
-      const signature = JSON.stringify([meta.owner_id, data.counts, counters, data.actor_count, meta.phase, state]);
+      const signature = JSON.stringify([meta.owner_id, data.counts, data.video_counts, counters, data.actor_count, meta.phase, state]);
       if (initial || (signature !== statusSignature && canRefreshAutomatically())) {
         statusSignature = signature;
         await render(!initial);

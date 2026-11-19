@@ -8,8 +8,10 @@ import hashlib
 import json
 import os
 import signal
+import shutil
 import sys
 import threading
+import time
 from pathlib import Path
 
 from . import __version__
@@ -78,6 +80,51 @@ def write_report(store):
     os.replace(str(temporary), str(index))
 
 
+@contextlib.contextmanager
+def console_color():
+    if not sys.stdout.isatty() or os.environ.get("TERM") == "dumb" or "NO_COLOR" in os.environ:
+        yield False
+        return
+    if os.name != "nt":
+        yield True
+        return
+
+    import ctypes
+    import msvcrt
+    from ctypes import wintypes
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.GetConsoleMode.argtypes = (wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD))
+    kernel.SetConsoleMode.argtypes = (wintypes.HANDLE, wintypes.DWORD)
+    handle = msvcrt.get_osfhandle(sys.stdout.fileno())
+    original = wintypes.DWORD()
+    enabled = kernel.GetConsoleMode(handle, ctypes.byref(original)) and kernel.SetConsoleMode(handle, original.value | 0x0004)
+    try:
+        yield bool(enabled)
+    finally:
+        if enabled:
+            kernel.SetConsoleMode(handle, original.value)
+
+
+def completion_banner(store, gaps, metadata_only, elapsed):
+    saved = dict(store.db().execute(
+        "SELECT kind, COUNT(*) FROM assets WHERE status IN ('done','partial') AND path<>'' GROUP BY kind"
+    ))
+    minutes, seconds = divmod(int(elapsed), 60)
+    title = "СБОР МЕТАДАННЫХ ЗАВЕРШЁН" if metadata_only else "ВЫГРУЗКА ЗАВЕРШЕНА"
+    if gaps:
+        title += " С ПРОПУСКАМИ"
+    width = min(80, max(len(title) + 4, shutil.get_terminal_size().columns - 1))
+    border = "=" * width
+    with console_color() as color:
+        start, reset = ("\033[1;92m", "\033[0m") if color else ("", "")
+        print("\n" + start + border + "\n" + title.center(width) + "\n" + border + reset, flush=True)
+    print("Время: %d мин %02d сек | Сохранённых вложений: %d" % (minutes, seconds, sum(saved.values())))
+    print("Фото: %d | Видео: %d | Документы: %d | Голосовые: %d" % tuple(saved.get(kind, 0) for kind in ("photo", "video", "doc", "voice")))
+    if gaps:
+        print("Разделов и вложений с пропусками: %d. Подробности в report.json." % gaps)
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="Загрузить данные VK API и файлы в локальный архив. Просмотр: отдельная команда view.py.")
     parser.add_argument("--version", action="version", version=__version__)
@@ -119,6 +166,7 @@ def main(argv=None):
         if args.files_only and not store.meta("owner_id"):
             raise RuntimeError("В архиве ещё нет данных аккаунта. Сначала выполните обычную загрузку с рабочим токеном.")
         with export_lock(store.root):
+            started = time.monotonic()
             previous = signal.getsignal(signal.SIGINT)
             def interrupt(signum, frame):
                 if stop.is_set():
@@ -149,7 +197,8 @@ def main(argv=None):
             store.meta("phase", "Обход завершён с пропусками; проверьте отчёт" if gaps else "Загрузка завершена")
             write_report(store)
             print("Отчёт: " + str(store.root / "report.json"))
-            print("Просмотр: python view.py --out " + json.dumps(str(store.root), ensure_ascii=False))
+            print("Просмотр: запустите view.py с той же папкой архива.")
+            completion_banner(store, gaps, args.metadata_only, time.monotonic() - started)
             return 2 if gaps else 0
     except (KeyboardInterrupt, DownloadStopped):
         if store and not args.verify:

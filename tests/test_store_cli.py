@@ -58,6 +58,23 @@ class StoreTests(unittest.TestCase):
         self.store.put("message", "50_2", {"id": 2, "text": "1000 готово"}, parent="50")
         self.assertEqual(self.store.objects("message", query="100%")["total"], 1)
 
+    def test_search_matches_decoded_text_in_forwards_and_respects_dialog_and_year(self):
+        forward = {"text": 'Привет!\nКак «дела»? 100%', "date": 1500000000}
+        self.store.put("message", "50_1", {"date": 1500000000, "fwd_messages": [forward]}, parent="50")
+        self.store.put("message", "50_2", {"date": 1700000000, "reply_message": forward}, parent="50")
+        self.store.put("message", "60_1", forward, parent="60")
+        self.store.put("message", "50_3", {"date": 1500000000, "attachments": [{"title": forward["text"]}]}, parent="50")
+        result = self.store.objects("message", parent="50", query="ПРИВЕТ!   как «дела»?", after=1483228800, before=1514764800)
+        self.assertEqual([row["key"] for row in result["items"]], ["50_1"])
+
+    def test_album_includes_archived_photos_with_matching_owner_and_album(self):
+        self.store.meta("owner_id", 42)
+        self.store.put("photo", "42_11", {"id": 11, "owner_id": 42, "album_id": -6}, parent="attachments")
+        self.store.put("photo", "51_12", {"id": 12, "owner_id": 51, "album_id": -6}, parent="attachments")
+        self.store.put("photo", "42_13", {"id": 13, "owner_id": 42, "album_id": 99}, parent="album:-6")
+        result = self.store.objects("photo", parent="album:-6")
+        self.assertEqual({row["key"] for row in result["items"]}, {"42_11", "42_13"})
+
     def test_partial_file_stays_visible_and_multiple_sources_survive_hydration(self):
         key = "photo:42_71"
         self.store.asset(key, "https://cdn.example.test/a.jpg", "photo", source={"category": "dialogs", "id": "50", "name": "Анна"})
@@ -130,6 +147,7 @@ class CommandTests(unittest.TestCase):
         self.addCleanup(store.close)
         self.assertEqual(store.meta("run_state"), "metadata_finished")
         self.assertTrue((self.root / "report.json").is_file())
+        self.assertIn("СБОР МЕТАДАННЫХ ЗАВЕРШЁН С ПРОПУСКАМИ", self.output.getvalue())
 
     def test_files_only_requires_successful_account_metadata(self):
         store = Store(self.root)

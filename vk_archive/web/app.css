@@ -123,6 +123,7 @@ main { min-width: 0; }
 .search-field::placeholder { color: #81868d; }
 .search-field:focus { border-color: #587a9d; }
 .year-field { width: 110px; flex: none; }
+.search-result-count { color: var(--muted); font-size: 12px; margin: 0 0 12px; }
 .pager { display: flex; align-items: center; justify-content: center; gap: 12px; padding: 6px 0 16px; flex-wrap: wrap; }
 .pager .range { color: var(--muted); font-size: 12px; min-width: 110px; text-align: center; }
 .dialog-list { padding: 4px 20px; }
@@ -146,6 +147,8 @@ main { min-width: 0; }
 .message-edited { display: inline-block; margin-top: 8px; color: #8c9199; font-size: 11px; }
 .quote { margin-top: 12px; border-left: 3px solid #6084aa; border-radius: 0 7px 7px 0; background: #262b31; padding: 9px 12px; min-width: 0; }
 .quote .quote { background: #2a3037; }
+.quote > .message-body > .message-meta { align-items: center; }
+.avatar.quoted { width: 24px; height: 24px; font-size: 9px; }
 .quote-label { display: block; margin-bottom: 5px; color: #94a4b7; font-size: 11px; }
 .event { padding: 9px 12px; margin: 8px 0; background: #2b333b; border-radius: 7px; color: #b9c9d9; font-size: 12px; }
 .attachment { margin-top: 10px; min-width: 0; }
@@ -157,6 +160,9 @@ main { min-width: 0; }
 .attachment-download { display: inline-flex; margin-top: 7px; font-size: 12px; }
 .video-poster { max-height: 220px; max-width: 100%; display: block; object-fit: contain; margin-bottom: 8px; border-radius: 8px; }
 .document { display: flex; align-items: center; gap: 12px; padding: 12px; background: #2c3137; border-radius: 8px; }
+.document-link { color: var(--text); }
+.document-link:hover { background: #39434e; text-decoration: none; }
+.document-link .attachment-download { color: var(--accent); }
 .document-icon { width: 40px; height: 44px; border-radius: 7px; display: grid; place-items: center; background: #3d5268; color: #d7e8f9; font-size: 10px; font-weight: 700; text-transform: uppercase; flex: none; }
 .document-name { overflow-wrap: anywhere; }
 .document-info { color: var(--muted); font-size: 11px; margin-top: 3px; }

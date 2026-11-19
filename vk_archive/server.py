@@ -15,6 +15,13 @@ def make_handler(store):
         def log_message(self, *args):
             pass
 
+        def handle(self):
+            try:
+                super().handle()
+            except ConnectionError:
+                # Windows can abort a request when the browser switches views or closes.
+                pass
+
         def finish(self):
             try:
                 super().finish()
@@ -64,12 +71,18 @@ def make_handler(store):
                     rows = store.rows("SELECT data FROM objects WHERE kind='profile' LIMIT 1")
                     self.send(store.bundle([json.loads(row["data"]) for row in rows]))
                 elif parsed.path == "/api/objects":
-                    self.send(store.objects(get("kind"), parent=get("parent"), offset=int(get("offset", "0")), limit=int(get("limit", "100")), query=get("q"), order=get("order", "desc"), after=int(get("after")) if get("after") else None, before=int(get("before")) if get("before") else None))
+                    self.send(store.objects(
+                        get("kind"), parent=get("parent"), source=get("source"),
+                        offset=int(get("offset", "0")), limit=int(get("limit", "100")),
+                        query=get("q"), order=get("order", "desc"),
+                        after=int(get("after")) if get("after") else None,
+                        before=int(get("before")) if get("before") else None,
+                    ))
                 elif parsed.path.startswith("/media/"):
                     self.media(urllib.parse.unquote(parsed.path[7:]))
                 else:
                     self.send({"error": "Не найдено"}, code=404)
-            except (BrokenPipeError, ConnectionResetError):
+            except ConnectionError:
                 pass
             except (ValueError, OverflowError):
                 self.send({"error": "Некорректные параметры"}, code=400)
@@ -78,12 +91,11 @@ def make_handler(store):
 
         def media(self, key):
             row = store.get_media(key)
-            if not row or row["status"] not in {"done", "partial"} or not row["path"]:
+            if not row or row["status"] not in {"done", "partial"}:
                 self.send({"error": "Файл не сохранён"}, code=404)
                 return
-            path = (store.root / row["path"]).resolve()
-            media_root = (store.root / "media").resolve()
-            if media_root not in path.parents or not path.is_file():
+            path = store.media_path(row)
+            if path is None:
                 self.send({"error": "Файл отсутствует"}, code=404)
                 return
             size = path.stat().st_size
@@ -107,7 +119,10 @@ def make_handler(store):
             mime = row["mime"] if safe else "application/octet-stream"
             extra = {"Accept-Ranges": "bytes"}
             if not safe:
-                extra["Content-Disposition"] = "attachment; filename*=UTF-8''" + urllib.parse.quote(row["name"] or path.name)
+                name = re.split(r"[/\\]", row["name"] or "")[-1].strip(" .")
+                if not name or (path.suffix and not name.lower().endswith(path.suffix.lower())):
+                    name = path.name
+                extra["Content-Disposition"] = "attachment; filename*=UTF-8''" + urllib.parse.quote(name, safe="")
             if ranged:
                 extra["Content-Range"] = "bytes %s-%s/%s" % (start, end, size)
             self.send_response(206 if ranged else 200)

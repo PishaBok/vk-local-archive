@@ -4,6 +4,7 @@ import datetime as dt
 import json
 import sqlite3
 import threading
+import unicodedata
 import urllib.parse
 from pathlib import Path
 
@@ -11,6 +12,8 @@ SCHEMA_VERSION = 2
 _UNSET = object()
 ACTOR_FIELDS = {"from_id", "owner_id", "user_id", "member_id", "reply_to_user", "signer_id", "created_by", "invited_by", "admin_id"}
 KINDS = {"profile", "conversation", "message", "member", "album", "photo", "video", "audio", "doc", "post", "comment", "friend", "group", "gift", "bookmark", "follower", "subscription"}
+LINK_FILTER = "EXISTS(SELECT 1 FROM links l WHERE l.kind=o.kind AND l.key=o.key AND l.parent=?)"
+SOURCE_FILTER = "('video:' || o.key) IN (SELECT s.asset_key FROM asset_sources s WHERE s.category=?)"
 
 
 def dumps(value):
@@ -19,6 +22,26 @@ def dumps(value):
 
 def now():
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def search_text(value):
+    return " ".join(unicodedata.normalize("NFC", value).casefold().split())
+
+
+def message_contains(raw, query):
+    def matches(message):
+        if not isinstance(message, dict):
+            return False
+        if query in search_text(str(message.get("text") or message.get("body") or "")):
+            return True
+        return matches(message.get("reply_message")) or any(matches(item) for item in message.get("fwd_messages") or [])
+
+    return matches(json.loads(raw))
+
+
+def photo_in_album(raw, album_id, owner_id):
+    photo = json.loads(raw)
+    return str(photo.get("album_id")) == album_id and str(photo.get("owner_id")) == owner_id
 
 
 def _picture(obj):
@@ -92,6 +115,8 @@ class Store:
                 conn.execute("PRAGMA synchronous=NORMAL")
             conn.row_factory = sqlite3.Row
             conn.create_function("CASEFOLD", 1, lambda value: str(value or "").casefold())
+            conn.create_function("MESSAGE_CONTAINS", 2, message_contains)
+            conn.create_function("PHOTO_IN_ALBUM", 3, photo_in_album)
             self.local.connection = conn
         return self.local.connection
 
@@ -190,6 +215,24 @@ class Store:
     def media_sources(self, key):
         return self.rows("SELECT * FROM asset_sources WHERE asset_key=? ORDER BY category,source_id", (key,))
 
+    def media_path(self, row, sources=None):
+        if row["status"] not in {"done", "partial"}:
+            return None
+        media = (self.root / "media").resolve()
+        if self.root not in media.parents:
+            return None
+        if sources is None:
+            sources = self.media_sources(row["key"])
+        for relative in [row["path"], *(source["path"] for source in sources)]:
+            if relative:
+                try:
+                    path = (self.root / relative).resolve()
+                    if media in path.parents and path.is_file():
+                        return path
+                except (OSError, RuntimeError, ValueError):
+                    continue
+        return None
+
     def rename_source(self, category, source_id, name):
         self.execute("UPDATE asset_sources SET name=? WHERE category=? AND source_id=?", (name, category, str(source_id)))
 
@@ -214,6 +257,10 @@ class Store:
             "counts": {row["kind"]: row["n"] for row in self.rows("SELECT kind,COUNT(*) n FROM objects GROUP BY kind")},
             "assets": {row["status"]: row["n"] for row in self.rows("SELECT status,COUNT(*) n FROM assets GROUP BY status")},
             "actor_count": self.db().execute("SELECT COUNT(*) FROM actors").fetchone()[0],
+        }
+        result["video_counts"] = {
+            name: self.db().execute("SELECT COUNT(*) FROM objects o WHERE o.kind='video' AND " + clause, (value,)).fetchone()[0]
+            for name, clause, value in (("video", LINK_FILTER, "own"), ("dialog_video", SOURCE_FILTER, "dialogs"))
         }
         if brief:
             result["meta"] = {key: value for key, value in result["meta"].items() if key in {"owner_id", "phase", "run_state"}}
@@ -288,29 +335,49 @@ class Store:
         for asset in assets.values():
             asset.pop("metadata", None)
             asset["sources"] = self.media_sources(asset["key"])
-            path = self.root / (asset["path"] or "__missing__")
-            asset["local"] = "/media/" + urllib.parse.quote(asset["key"], safe="") if asset["status"] in {"done", "partial"} and asset["path"] and path.is_file() else ""
+            path = self.media_path(asset, asset["sources"])
+            asset["local"] = "/media/" + urllib.parse.quote(asset["key"], safe="") if path else ""
+            if path:
+                asset["path"] = path.relative_to(self.root).as_posix()
         return {"items": items, "actors": actors, "assets": list(assets.values())}
 
-    def objects(self, kind, parent="", offset=0, limit=100, query="", order="desc", after=None, before=None):
+    def objects(self, kind, parent="", offset=0, limit=100, query="", order="desc", after=None, before=None, source=""):
         if kind not in KINDS:
             raise ValueError("Неизвестный раздел")
         clauses, params = ["o.kind=?"], [kind]
+        table = "objects o"
         if parent:
-            clauses.append("EXISTS(SELECT 1 FROM links l WHERE l.kind=o.kind AND l.key=o.key AND l.parent=?)")
-            params.append(str(parent))
-        if query:
+            album_id = str(parent).removeprefix("album:")
+            owner_id = self.meta("owner_id") if kind == "photo" and str(parent).startswith("album:") else None
+            if owner_id and album_id.lstrip("-").isdigit():
+                # Older archives can have the photo from a dialog but no album link.
+                clauses.append("(" + LINK_FILTER + " OR PHOTO_IN_ALBUM(o.data,?,?))")
+                params.extend((str(parent), album_id, str(owner_id)))
+            else:
+                table = "links l JOIN objects o ON o.kind=l.kind AND o.key=l.key"
+                clauses = ["l.kind=?", "l.parent=?"]
+                params.append(str(parent))
+        if source:
+            if kind != "video" or source != "dialogs":
+                raise ValueError("Неизвестный источник видео")
+            clauses.append(SOURCE_FILTER)
+            params.append(source)
+        if kind == "message" and search_text(query):
+            clauses.append("MESSAGE_CONTAINS(o.data,?)")
+            params.append(search_text(query))
+        elif query.strip():
             clauses.append("(CASEFOLD(o.data) LIKE ? ESCAPE '\\' OR CASEFOLD(o.title) LIKE ? ESCAPE '\\' OR EXISTS(SELECT 1 FROM actors a WHERE CAST(a.id AS TEXT)=o.key AND CASEFOLD(a.name) LIKE ? ESCAPE '\\'))")
-            needle = query.casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+            needle = query.strip().casefold().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
             params.extend(("%" + needle + "%",) * 3)
         for value, condition in ((after, "o.ts>=?"), (before, "o.ts<?")):
             if value is not None:
                 clauses.append(condition)
                 params.append(int(value))
         where = " AND ".join(clauses)
-        total = self.db().execute("SELECT COUNT(*) FROM objects o WHERE " + where, params).fetchone()[0]
+        base = " FROM " + table + " WHERE " + where
+        total = self.db().execute("SELECT COUNT(*)" + base, params).fetchone()[0]
         direction = "ASC" if order.lower() == "asc" else "DESC"
-        rows = self.rows("SELECT o.* FROM objects o WHERE " + where + " ORDER BY o.ts " + direction + ",o.rowid " + direction + " LIMIT ? OFFSET ?", tuple(params) + (min(200, max(1, int(limit))), max(0, int(offset))))
+        rows = self.rows("SELECT o.*" + base + " ORDER BY o.ts " + direction + ",o.rowid " + direction + " LIMIT ? OFFSET ?", tuple(params) + (min(200, max(1, int(limit))), max(0, int(offset))))
         for row in rows:
             row["data"] = json.loads(row["data"])
         result = self.bundle(rows)

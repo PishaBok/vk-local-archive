@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import re
 from typing import Any, Dict, Optional
 
 from .api import ApiError, Stopped
@@ -18,6 +19,12 @@ ACTOR_FIELDS = {
     "created_by", "invited_by", "admin_id",
 }
 FATAL_CODES = {5, 14, 17}
+SYSTEM_ALBUMS = {
+    "profile": "Фотографии профиля",
+    "wall": "Фотографии со стены",
+    "saved": "Сохранённые фотографии",
+}
+MEDIA_LOOKUP_BATCH = 50
 
 
 def json_text(value: Any) -> str:
@@ -34,6 +41,17 @@ def digest(value: Any, length: int = 24) -> str:
 
 def source_context(category: str, ident: Any, name: str, date: Any = 0) -> Dict[str, Any]:
     return {"category": category, "id": str(ident), "name": str(name), "date": int(date or 0)}
+
+
+def video_files(video):
+    files = video.get("files")
+    if not isinstance(files, dict):
+        return []
+    return [
+        (int(field[4:]), url)
+        for field, url in files.items()
+        if field.startswith("mp4_") and field[4:].isdigit() and isinstance(url, str) and url
+    ]
 
 
 class Collector:
@@ -103,10 +121,7 @@ class Collector:
             url = choose_picture(value)
             name = "Стикер " + key
         elif kind == "video":
-            variants = []
-            for field, address in (value.get("files") or {}).items():
-                if field.startswith("mp4_") and field[4:].isdigit() and isinstance(address, str):
-                    variants.append((int(field[4:]), address))
+            variants = video_files(value)
             if variants:
                 url = max(variants)[1]
             else:
@@ -147,7 +162,7 @@ class Collector:
         if "album_id" in value and "owner_id" in value and "id" in value:
             self.attachment("photo", value, source)
         elif "owner_id" in value and "id" in value:
-            if "ext" in value and "url" in value:
+            if "ext" in value and ("url" in value or "size" in value):
                 self.attachment("doc", value, source)
             elif "artist" in value and "duration" in value:
                 self.attachment("audio", value, source)
@@ -280,31 +295,99 @@ class Collector:
                 ))
 
     def photos(self) -> None:
+        def save_cover(album, source):
+            if not choose_picture(album) and album.get("thumb_src"):
+                url = album["thumb_src"]
+                key = "image:" + hashlib.sha256(url.encode("utf-8")).hexdigest()[:32]
+                self.asset(key, url, "preview", album, source, name="Обложка «" + source["name"] + "»")
+
+        def save_album(album):
+            if not album.get("id"):
+                return
+            ident = str(album["id"])
+            title = album.get("title") or "Альбом " + ident
+            source = source_context("albums", ident, title)
+            self.ingest("album", album, parent="own", source=source)
+
+        album_params = {"owner_id": self.uid, "need_system": 1, "need_covers": 1, "photo_sizes": 1}
         self.step("Список альбомов", lambda: self.pages(
-            "photos.getAlbums", {"owner_id": self.uid, "need_system": 1, "need_covers": 1, "photo_sizes": 1},
-            "Альбомы", lambda x: self.ingest("album", x, parent="own", source=source_context("albums", x.get("id", 0), x.get("title") or "Альбом")),
+            "photos.getAlbums", album_params, "Альбомы", save_album,
         ))
-        albums = {}
-        for row in self.store.rows("SELECT data FROM objects WHERE kind='album'"):
-            item = json.loads(row["data"])
-            albums[str(item["id"])] = item.get("title") or "Альбом " + str(item["id"])
-        for aid, title in (("profile", "Фотографии профиля"), ("wall", "Фотографии со стены"), ("saved", "Сохранённые фотографии")):
-            albums.setdefault(aid, title)
-        for aid, title in sorted(albums.items()):
+        albums = {str(item["id"]): item for item in (
+            json.loads(row["data"]) for row in self.store.rows("SELECT data FROM objects WHERE kind='album'")
+        ) if item.get("id") and item.get("owner_id", self.uid) == self.uid}
+
+        def title_for(aid):
+            return albums.get(aid, {}).get("title") or SYSTEM_ALBUMS.get(aid) or "Альбом " + aid
+
+        for aid, album in albums.items():
+            save_cover(album, source_context("albums", aid, title_for(aid)))
+
+        def save_photo(photo, aid):
+            actual_album = str(photo.get("album_id", ""))
+            canonical = actual_album if aid in SYSTEM_ALBUMS and actual_album.startswith("-") else aid
+            if canonical not in albums and canonical == actual_album and canonical.lstrip("-").isdigit():
+                album = {"id": int(canonical), "owner_id": self.uid, "title": SYSTEM_ALBUMS.get(aid, title_for(canonical))}
+                albums[canonical] = album
+                save_album(album)
+            source = source_context("albums", canonical, title_for(canonical), photo.get("date", 0))
+            self.ingest("photo", photo, parent="album:" + canonical, source=source)
+            self.store.execute("INSERT OR IGNORE INTO links(kind,key,parent) VALUES ('photo',?,'photos:own')", (object_key(photo),))
+            if canonical != aid:
+                self.store.execute("INSERT OR IGNORE INTO links(kind,key,parent) VALUES ('photo',?,?)", (object_key(photo), "album:" + aid))
+
+        direct_tasks = {}
+        # photos.get takes the string aliases for service albums. VK's returned
+        # numeric album ID still identifies those photos in the archive.
+        for aid in sorted(set(SYSTEM_ALBUMS) | {aid for aid in albums if not aid.startswith("-")}):
+            title = title_for(aid)
+            params = {"owner_id": self.uid, "album_id": aid, "extended": 1, "photo_sizes": 1}
+            label = "Фото: " + title
+
             def save(photo, aid=aid):
-                actual_album = str(photo.get("album_id", ""))
-                # Prefer a server-returned system album already present in the
-                # album list; no hard-coded mapping of VK's negative IDs.
-                canonical = actual_album if aid in ("profile", "wall", "saved") and photo.get("owner_id", self.uid) == self.uid and actual_album.startswith("-") and actual_album in albums else aid
-                source = source_context("albums", canonical, albums[canonical], photo.get("date", 0))
-                self.ingest("photo", photo, parent="album:" + aid, source=source)
-                self.store.execute("INSERT OR IGNORE INTO links(kind,key,parent) VALUES ('photo',?,'photos:own')", (object_key(photo),))
-                if canonical != aid:
-                    self.store.execute("INSERT OR IGNORE INTO links(kind,key,parent) VALUES ('photo',?,?)", (object_key(photo), "album:" + canonical))
-            self.step("Фото альбома " + title, lambda aid=aid, title=title: self.pages(
-                "photos.get", {"owner_id": self.uid, "album_id": aid, "extended": 1, "photo_sizes": 1},
-                "Фото: " + title, save, count=1000,
+                if photo.get("owner_id", self.uid) == self.uid:
+                    save_photo(photo, aid)
+            self.step("Фото альбома " + title, lambda: self.pages(
+                "photos.get", params, label, save, count=1000,
             ))
+            direct_tasks[aid] = self.store.task("photos.get:" + digest(params, 16), label)
+
+        def album_counts():
+            return {row["parent"][6:]: row["count"] for row in self.store.rows(
+                "SELECT parent, COUNT(*) AS count FROM links WHERE kind='photo' AND parent LIKE 'album:%' GROUP BY parent"
+            )}
+
+        counts = album_counts()
+        expected = {
+            aid: max(album.get("size") or 0, direct_tasks.get(aid, {}).get("expected") or 0)
+            for aid, album in albums.items()
+        }
+        incomplete = {
+            aid for aid in albums if counts.get(aid, 0) < expected[aid]
+            or ("size" not in albums[aid] and not counts.get(aid))
+            or direct_tasks.get(aid, {}).get("status") == "error"
+        }
+        discovery = self.store.task("photos.getAlbums:" + digest(album_params, 16), "Альбомы")
+        discovery_incomplete = discovery["status"] != "done" or discovery["received"] < (discovery["expected"] or 0)
+        if incomplete or discovery_incomplete:
+            def save_fallback(photo):
+                aid = str(photo.get("album_id", ""))
+                if photo.get("owner_id") == self.uid and aid.lstrip("-").isdigit():
+                    save_photo(photo, aid)
+
+            self.step("Запасной обход фотографий", lambda: self.pages(
+                "photos.getAll", {"owner_id": self.uid, "photo_sizes": 1, "no_service_albums": 0},
+                "Запасной обход фотографий", save_fallback, count=200,
+            ))
+            counts = album_counts()
+
+        for aid, wanted in expected.items():
+            task_key = "photos.coverage:" + aid
+            received = counts.get(aid, 0)
+            state = "partial" if received < wanted else "done"
+            error = "API сообщил о %s фото, удалось получить %s." % (wanted, received) if state == "partial" else ""
+            self.store.task(task_key, title_for(aid) + " — полученные фотографии", status=state,
+                            received=received, expected=wanted if wanted else received, error=error)
 
     def comments(self) -> None:
         for row in self.store.rows("SELECT key,data FROM objects WHERE kind='post'"):
@@ -351,28 +434,73 @@ class Collector:
             "video.get", {"owner_id": self.uid, "extended": 1}, "Видео",
             lambda x: self.ingest("video", x, parent="own", source=dict(own_source, date=x.get("date", 0))), count=200,
         ))
-        for row in self.store.rows("SELECT key,data FROM objects WHERE kind='video'"):
-            video = json.loads(row["data"])
-            if video.get("files"):
-                continue
-            ref = object_key(video) + ("_" + video["access_key"] if video.get("access_key") else "")
+        self.refresh_media_urls("video")
 
-            def fetch(ref=ref, old=video, key=row["key"]):
-                task = "video.details:" + key
-                if self.store.task(task, "Файл видео " + key)["status"] == "done":
-                    return
+    def refresh_media_urls(self, kind: str) -> None:
+        method, parameter = ("video.get", "videos") if kind == "video" else ("docs.getById", "docs")
+        candidates = []
+        rows = self.store.rows("""
+            SELECT o.key, o.data, a.status, a.url, t.status AS details_status
+            FROM objects o
+            JOIN assets a ON a.key=o.kind || ':' || o.key
+            LEFT JOIN tasks t ON t.key=o.kind || '.details:' || o.key
+            WHERE o.kind=? AND a.status NOT IN ('done','partial')
+            ORDER BY o.key
+        """, (kind,))
+        for row in rows:
+            key = row["key"]
+            if not re.fullmatch(r"-?[1-9]\d*_[1-9]\d*", key):
+                continue
+            # A new address already collected in this run is ready to download.
+            # A failed saved file needs a fresh lookup even when it had an MP4.
+            if row["status"] != "failed" and (row["url"] or row["details_status"] == "done"):
+                continue
+            item = json.loads(row["data"])
+            ref = key
+            if kind == "video" and item.get("access_key"):
+                ref += "_" + str(item["access_key"])
+            candidates.append((key, ref, item))
+
+        section = "Адреса видео" if kind == "video" else "Адреса документов"
+        for start in range(0, len(candidates), MEDIA_LOOKUP_BATCH):
+            batch = candidates[start:start + MEDIA_LOOKUP_BATCH]
+
+            def fetch(batch=batch):
+                params = {parameter: ",".join(ref for _, ref, _ in batch)}
+                if kind == "video":
+                    params["extended"] = 1
                 try:
-                    result = self.api.call("video.get", videos=ref, extended=1)
-                    if not isinstance(result, dict) or not isinstance(result.get("items"), list):
-                        raise RuntimeError("video.get: неожиданный ответ")
-                    self.scan({"profiles": result.get("profiles", []), "groups": result.get("groups", [])})
-                    for item in result["items"]:
-                        self.ingest("video", dict(old, **item))
-                    self.store.task(task, "Файл видео " + key, status="done")
-                except Exception as exc:
-                    self.store.task(task, "Файл видео " + key, status="error", error=self.clean_error(exc))
+                    result = self.api.call(method, **params)
+                    if isinstance(result, dict):
+                        self.scan({"profiles": result.get("profiles", []), "groups": result.get("groups", [])})
+                    items = result.get("items") if isinstance(result, dict) else result
+                    if not isinstance(items, list):
+                        raise RuntimeError(method + ": неожиданный ответ")
+                except Stopped:
                     raise
-            self.step("Файл видео " + row["key"], fetch)
+                except Exception as exc:
+                    for key, _, _ in batch:
+                        self.store.task(kind + ".details:" + key, section + " " + key, status="error", error=self.clean_error(exc))
+                    raise
+                returned = {object_key(item): item for item in items if isinstance(item, dict)}
+                for key, _, old in batch:
+                    if self.stop.is_set():
+                        raise Stopped()
+                    task = kind + ".details:" + key
+                    label = section + " " + key
+                    item = returned.get(key)
+                    if not item:
+                        self.store.task(task, label, status="error", error="API не вернул объект при обновлении адреса.")
+                        continue
+                    merged = dict(old, **item)
+                    if kind == "video" and not video_files(item) and video_files(old):
+                        merged["files"] = old["files"]
+                    if kind == "doc" and not item.get("url") and old.get("url"):
+                        merged["url"] = old["url"]
+                    self.attachment(kind, merged)
+                    self.store.task(task, label, status="done", error="")
+
+            self.step(section, fetch)
 
     def resolve_actors(self) -> None:
         # Finished pages are skipped on resume, so recover IDs from stored JSON.
@@ -497,6 +625,7 @@ class Collector:
             ))
             self.step("Комментарии", self.comments)
             self.step("Видеозаписи", self.videos)
+            self.step("Обновление адресов документов", lambda: self.refresh_media_urls("doc"))
             self.step("Имена участников", self.resolve_actors)
             self.store.meta("run_state", "api_finished")
             self.store.meta("phase", "Сбор данных API завершён")

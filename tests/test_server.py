@@ -7,8 +7,9 @@ import tempfile
 import threading
 import unittest
 from pathlib import Path
+from unittest import mock
 
-from vk_archive.server import create_server
+from vk_archive.server import create_server, make_handler
 from vk_archive.store import Store
 
 
@@ -24,11 +25,16 @@ class ServerTests(unittest.TestCase):
         store.put("profile", "42", {"id": 42, "first_name": "Иван"})
         store.put("conversation", "50", {"conversation": {"peer": {"id": 50}}, "last_message": {"from_id": 42, "date": 1700000000}})
         store.put("message", "50_1", {"id": 1, "peer_id": 50, "from_id": 50, "text": '<script>alert("test")</script> 😀', "date": 1700000000}, parent="50")
+        for ident in (1, 2, 3):
+            store.put("video", "42_%d" % ident, {"id": ident, "owner_id": 42}, parent="own" if ident < 3 else "attachments")
+            if ident > 1:
+                store.asset("video:42_%d" % ident, "", "video", source={"category": "dialogs", "id": "50"})
         store.asset("doc:42_91", "https://cdn.example.test/doc", "doc", name="Диплом.docx", source={"category": "dialogs", "id": "50", "name": "Анна"})
         path = cls.root / "media" / "documents" / "dialogs" / "Анна__50" / "Диплом.docx"
         path.parent.mkdir(parents=True)
         path.write_bytes(b"12345")
-        store.mark_media_done("doc:42_91", path, 5, hashlib.sha256(b"12345").hexdigest(), "text/html")
+        store.mark_media_done("doc:42_91", path.with_name("Отсутствующий.docx"), 5, hashlib.sha256(b"12345").hexdigest(), "text/html")
+        store.set_source_path("doc:42_91", "dialogs", "50", path)
         store.close()
         cls.store = Store(cls.root, create=False)
         cls.server = create_server(cls.store)
@@ -79,6 +85,23 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(self.request("/media/doc%3A42_91", {"Range": "bytes=100-"})[0], 416)
         self.assertEqual(self.request("/media/doc%3A42_91", {"Range": "bytes=-2"})[2], b"45")
         self.assertEqual(self.request("/media/doc%3A42_91", method="HEAD")[2], b"")
+
+    def test_video_sections_filter_existing_archive_by_source(self):
+        for query, keys in (("parent=own", {"42_1", "42_2"}), ("source=dialogs", {"42_2", "42_3"})):
+            status, _, body = self.request("/api/objects?kind=video&" + query)
+            self.assertEqual(status, 200)
+            self.assertEqual({row["key"] for row in json.loads(body)["items"]}, keys)
+        self.assertEqual(json.loads(self.request("/api/status?brief=1")[2])["video_counts"], {"video": 2, "dialog_video": 2})
+
+    def test_windows_connection_abort_does_not_try_to_send_second_response(self):
+        handler_type = make_handler(self.store)
+        handler = handler_type.__new__(handler_type)
+        handler.server = self.server
+        handler.path = "/api/status"
+        handler.headers = {"Host": "127.0.0.1:%d" % self.server.server_port}
+        handler.send = mock.Mock(side_effect=ConnectionAbortedError(10053, "Browser disconnected"))
+        handler.do_GET()
+        handler.send.assert_called_once()
 
     def test_no_arbitrary_files_or_foreign_host(self):
         self.assertEqual(self.request("/archive.sqlite3")[0], 404)

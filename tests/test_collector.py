@@ -136,6 +136,7 @@ class CollectorTests(unittest.TestCase):
         self.assertEqual(counts["comment"], 24)
         self.assertTrue(any(method == "messages.getHistory" and params.get("offset") == 200 for method, params in api.calls))
         self.assertTrue(any(method == "wall.getComments" and params.get("comment_id") == 1 for method, params in api.calls))
+        self.assertFalse(any(method == "photos.getAll" for method, _ in api.calls))
         tasks = self.store.status()["tasks"]
         self.assertTrue(any(row["status"] == "error" and row["label"] == "Сообщества" for row in tasks))
         self.assertTrue(any(row["status"] == "unsupported" and row["label"] == "Музыкальная коллекция" for row in tasks))
@@ -202,7 +203,9 @@ class CollectorTests(unittest.TestCase):
         def call(method, **params):
             if method == "photos.getAlbums":
                 return {"count": 1, "items": [{"id": -77, "owner_id": 42, "title": "Системный альбом"}][params["offset"]:]}
-            items = [photo] if params["album_id"] in ("-77", "saved") else []
+            self.assertEqual(method, "photos.get")
+            self.assertNotEqual(params["album_id"], "-77")
+            items = [photo] if params["album_id"] == "saved" else []
             return {"count": len(items), "items": items[params["offset"]:]}
 
         collector.api.call = call
@@ -213,6 +216,79 @@ class CollectorTests(unittest.TestCase):
         parents = {row["parent"] for row in self.store.rows("SELECT parent FROM links WHERE kind='photo' AND key='42_71'")}
         self.assertIn("album:-77", parents)
         self.assertIn("album:saved", parents)
+
+    def test_bulk_fallback_recovers_album_photos_and_reports_missing_remainder(self):
+        collector = Collector(FakeAPI(self.store, self.stop), self.store, self.stop)
+        collector.uid = 42
+        thumb = "https://cdn.example.test/cover.jpg"
+        photo = dict(PHOTO, album_id=-77)
+
+        def call(method, **params):
+            if method == "photos.getAlbums":
+                return {"count": 1, "items": [{"id": -77, "owner_id": 42, "title": "Системный", "size": 2, "thumb_src": thumb}]}
+            if method == "photos.get":
+                return {"count": 0, "items": []}
+            self.assertEqual(method, "photos.getAll")
+            self.assertEqual(params["no_service_albums"], 0)
+            return {"count": 2, "items": [photo, dict(photo, owner_id=99, id=72)]}
+
+        collector.api.call = call
+        with contextlib.redirect_stdout(io.StringIO()):
+            collector.photos()
+        self.assertEqual(self.store.objects("photo", parent="album:-77")["total"], 1)
+        self.assertEqual(self.store.objects("photo", parent="photos:own")["total"], 1)
+        self.assertIsNone(self.store.get_media("photo:99_72"))
+        self.assertEqual(self.store.rows("SELECT kind FROM assets WHERE url=?", (thumb,))[0]["kind"], "preview")
+        task = self.store.task("photos.coverage:-77", "Системный")
+        self.assertEqual((task["status"], task["received"], task["expected"]), ("partial", 1, 2))
+
+    def test_protected_or_missing_direct_video_urls_are_rechecked_in_one_batch(self):
+        collector = Collector(FakeAPI(self.store, self.stop), self.store, self.stop)
+        source = source_context("dialogs", 50, "Тест")
+        expired = dict(VIDEO, files={"mp4_720": "https://cdn.example.test/expired.mp4"})
+        collector.attachment("video", expired, source)
+        collector.attachment("video", dict(VIDEO, id=82, files={"external": "https://player.example.test/"}), source)
+        self.store.mark_media_error("video:42_81", "failed", "Истекла ссылка")
+        self.store.task("video.details:42_81", "Видео", status="done")
+        collector.attachment("video", dict(expired, id=83), source)
+        self.store.mark_media_done("video:42_83", "media/ready.mp4", 1, "hash", "video/mp4")
+        fresh = "https://cdn.example.test/fresh.mp4"
+        requests = []
+
+        def call(method, **params):
+            requests.append((method, params))
+            # Only one of the two requested videos is available to this token.
+            return {"items": [dict(VIDEO, files={"mp4_360": fresh})]}
+
+        collector.api.call = call
+        with contextlib.redirect_stdout(io.StringIO()):
+            collector.refresh_media_urls("video")
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(requests[0][1]["videos"], "42_81_test-access-key,42_82_test-access-key")
+        self.assertEqual(self.store.get_media("video:42_81")["url"], fresh)
+        self.assertEqual(self.store.get_media("video:42_83")["status"], "done")
+        self.assertEqual(self.store.task("video.details:42_82", "Видео")["status"], "error")
+
+    def test_failed_documents_get_new_urls_without_refreshing_saved_files(self):
+        collector = Collector(FakeAPI(self.store, self.stop), self.store, self.stop)
+        source = source_context("dialogs", 50, "Тест")
+        collector.attachment("doc", DOCUMENT, source)
+        collector.attachment("doc", dict(DOCUMENT, id=92), source)
+        self.store.mark_media_error("doc:42_91", "failed", "Истекла ссылка")
+        self.store.mark_media_done("doc:42_92", "media/ready.docx", 5, "hash", "application/octet-stream")
+        fresh = "https://cdn.example.test/fresh.docx"
+        requests = []
+
+        def call(method, **params):
+            requests.append((method, params))
+            return [dict(DOCUMENT, url=fresh)]
+
+        collector.api.call = call
+        with contextlib.redirect_stdout(io.StringIO()):
+            collector.refresh_media_urls("doc")
+        self.assertEqual(requests, [("docs.getById", {"docs": "42_91"})])
+        self.assertEqual(self.store.get_media("doc:42_91")["url"], fresh)
+        self.assertEqual(self.store.media_sources("doc:42_91")[0]["category"], "dialogs")
 
     def test_interruption_checkpoints_only_committed_pages(self):
         api = FakeAPI(self.store, self.stop)

@@ -6,7 +6,9 @@ objects; the downloader sends no cookies or authentication headers to them.
 
 import contextlib
 import datetime as dt
+import errno
 import hashlib
+import http.client
 import importlib.util
 import ipaddress
 import json
@@ -15,6 +17,7 @@ import os
 import re
 import shutil
 import socket
+import ssl
 import subprocess
 import sys
 import tempfile
@@ -203,6 +206,46 @@ class DownloadResult:
     mime: str
 
 
+def _http_error(status: int) -> MediaDownloadError:
+    message = "Сервер файла вернул HTTP %s" % status
+    if status in {401, 403, 404, 410}:
+        message += " (файл недоступен или ссылка устарела; попробуйте загрузчик с --refresh)"
+    elif status == 407:
+        message += " (прокси требует авторизацию)"
+    return MediaDownloadError(message, retryable=status in {408, 429, 500, 502, 503, 504})
+
+
+def _network_error(error: Exception) -> MediaDownloadError:
+    """Classify urllib failures without exposing URLs, credentials or raw errors."""
+    reason = error.reason if isinstance(error, urllib.error.URLError) else error
+    if isinstance(reason, ssl.SSLCertVerificationError):
+        return MediaDownloadError("Не удалось проверить сертификат HTTPS (TLS); проверьте дату системы и доверенные сертификаты")
+    if isinstance(reason, ssl.SSLEOFError):
+        return MediaDownloadError("Сервер закрыл TLS-соединение до завершения загрузки", retryable=True)
+    if isinstance(reason, ssl.SSLError):
+        return MediaDownloadError("Ошибка TLS при подключении к серверу файла")
+    if isinstance(reason, (TimeoutError, socket.timeout)):
+        return MediaDownloadError("Истекло время ожидания ответа сервера файла", retryable=True)
+    if isinstance(reason, socket.gaierror):
+        return MediaDownloadError("Не удалось определить адрес сервера файла (DNS)", retryable=True)
+    if isinstance(reason, http.client.IncompleteRead):
+        return MediaDownloadError("Сервер закрыл соединение до получения полного файла", retryable=True)
+    # urllib reports a failed HTTPS CONNECT as URLError(OSError(...)).
+    proxy = re.match(r"Tunnel connection failed:\s*([1-5]\d{2})\b", str(reason))
+    if proxy:
+        status = int(proxy.group(1))
+        return MediaDownloadError("Прокси отклонил HTTPS-соединение (HTTP %s)" % status, retryable=status in {408, 429, 502, 503, 504})
+    code = getattr(reason, "winerror", None) or getattr(reason, "errno", None)
+    if code in {errno.EACCES, errno.EPERM, 10013}:
+        return MediaDownloadError("ОС запретила соединение с сервером файла (код %s); проверьте настройки сети и прокси" % code)
+    if code in {errno.ETIMEDOUT, 10060}:
+        return MediaDownloadError("Истекло время ожидания ответа сервера файла (код %s)" % code, retryable=True)
+    if isinstance(reason, ConnectionError) or isinstance(code, int):
+        suffix = " (код %s)" % code if isinstance(code, int) else ""
+        return MediaDownloadError("Не удалось установить или сохранить соединение с сервером файла" + suffix, retryable=True)
+    return MediaDownloadError("Не удалось скачать файл по сети; проверьте подключение и настройки прокси", retryable=True)
+
+
 def public_https(url: str) -> str:
     """Reject unsupported schemes, embedded credentials and local addresses."""
     try:
@@ -214,7 +257,7 @@ def public_https(url: str) -> str:
     try:
         addresses = socket.getaddrinfo(parsed.hostname, 443, type=socket.SOCK_STREAM)
     except OSError:
-        raise MediaDownloadError("Не удалось определить адрес сервера файла", retryable=True) from None
+        raise MediaDownloadError("Не удалось определить адрес сервера файла (DNS)", retryable=True) from None
     if not addresses or any(not ipaddress.ip_address(item[4][0]).is_global for item in addresses):
         raise MediaDownloadError("Локальный или служебный адрес файла запрещён")
     return url
@@ -273,7 +316,10 @@ def _validate_payload(head: bytes, mime: str, kind: str, ext: str) -> str:
             raise MediaDownloadError("Вместо медиа сервер вернул текст или ошибку")
         if stripped.startswith((b"<?xml", b"<error", b'{"error')) and mime != "image/svg+xml":
             raise MediaDownloadError("Вместо медиа сервер вернул текст или ошибку")
-    return _sniff_mime(head, mime, kind) if kind != "doc" else mime
+    detected = _sniff_mime(head, mime, kind) if kind != "doc" else mime
+    if kind == "video" and (detected.startswith(("image/", "audio/")) or stripped.startswith(b"%pdf-")):
+        raise MediaDownloadError("По адресу видео получен файл другого типа")
+    return detected
 
 
 def _stopped(stop) -> None:
@@ -294,6 +340,7 @@ def download_file(url: str, destination: Path, kind: str, *, expected_size: int 
         with opener.open(request, timeout=timeout) as response:
             reported = response.headers.get_content_type()
             declared = response.headers.get("Content-Length")
+            content_range = response.headers.get("Content-Range")
             head = response.read(8192)
             mime = _validate_payload(head, reported, kind, expected_ext or destination.suffix)
             original_ext = expected_ext or (destination.suffix if destination.suffix.lower() != ".bin" else "")
@@ -317,17 +364,26 @@ def download_file(url: str, destination: Path, kind: str, *, expected_size: int 
                     raise MediaDownloadError("Сервер вернул некорректный размер файла") from None
                 if size != length:
                     raise MediaDownloadError("Файл получен не полностью", retryable=True)
+            if content_range or getattr(response, "status", None) == 206:
+                match = re.fullmatch(r"bytes 0-(\d+)/(\d+)", content_range or "")
+                if not match or int(match[1]) + 1 != size or int(match[2]) != size:
+                    raise MediaDownloadError("Сервер вернул только часть файла", retryable=True)
             if expected_size and size != int(expected_size):
                 raise MediaDownloadError("Размер документа не совпадает с размером, указанным API")
             os.replace(str(temp), str(final))
             temp = None
             return DownloadResult(final.resolve(), size, digest.hexdigest(), mime)
     except urllib.error.HTTPError as exc:
-        raise MediaDownloadError("Сервер файла вернул HTTP %s" % exc.code, retryable=exc.code in {408, 429, 500, 502, 503, 504}) from None
-    except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-        raise MediaDownloadError("Сетевая ошибка при скачивании: " + type(exc).__name__, retryable=True) from None
+        if exc.fp is not None:
+            with contextlib.suppress(OSError):
+                exc.close()
+        raise _http_error(exc.code) from None
+    except (urllib.error.URLError, TimeoutError, ConnectionError, socket.gaierror, ssl.SSLError, http.client.HTTPException) as exc:
+        raise _network_error(exc) from None
     except OSError as exc:
-        raise MediaDownloadError("Ошибка файла/соединения: " + type(exc).__name__, retryable=isinstance(exc, socket.timeout)) from None
+        if (getattr(exc, "winerror", 0) or 0) >= 10000 or exc.errno in {errno.EHOSTUNREACH, errno.ENETUNREACH, errno.ENETDOWN, errno.EPIPE}:
+            raise _network_error(exc) from None
+        raise
     finally:
         if temp is not None:
             with contextlib.suppress(OSError):
@@ -387,6 +443,37 @@ def _metadata(row: Mapping[str, Any]) -> Dict[str, Any]:
         except (ValueError, TypeError):
             value = {}
     return value if isinstance(value, dict) else {}
+
+
+def _direct_sources(row: Mapping[str, Any]):
+    primary = row.get("url")
+    if row["kind"] != "video":
+        return [("", primary)] if primary else []
+    files = _metadata(row).get("files")
+    options = []
+    if isinstance(files, dict):
+        for key, url in files.items():
+            match = re.fullmatch(r"mp4_(\d{1,4})", key)
+            if match and isinstance(url, str) and url:
+                options.append((int(match[1]), url))
+    sources = {}
+    for resolution, url in sorted(options, reverse=True):
+        sources.setdefault(url, "%sp" % resolution)
+    if primary and primary not in sources:
+        sources[primary] = "прямой адрес"
+    return [(label, url) for url, label in sources.items()]
+
+
+def _write_error(error):
+    code = getattr(error, "winerror", None) or getattr(error, "errno", None)
+    if code in {errno.ENOSPC, 112}:
+        return MediaDownloadError("Недостаточно места на диске для сохранения файла")
+    if code in {errno.ENAMETOOLONG, 206}:
+        return MediaDownloadError("Слишком длинный путь к файлу; укажите более короткую папку архива через --out")
+    if code in {errno.EACCES, errno.EPERM, 5, 32}:
+        return MediaDownloadError("Не удалось записать файл; проверьте права на папку и не открыт ли файл другой программой")
+    suffix = " (код %s)" % code if isinstance(code, int) else ""
+    return MediaDownloadError("Ошибка записи файла" + suffix)
 
 
 class Downloader:
@@ -464,8 +551,9 @@ class Downloader:
         public_https(url)
         destination.parent.mkdir(parents=True, exist_ok=True)
         template = str(destination.with_suffix("")).replace("%", "%%") + ".%(ext)s"
-        cmd = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist", "--no-cache-dir", "--no-progress", "--no-warnings", "--socket-timeout", "30", "--retries", "2", "--fragment-retries", "2", "--format", "best[ext=mp4]/best", "--output", template, "--print", "after_move:filepath", "--", url]
-        with subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True, encoding="utf-8", errors="replace") as process:
+        cmd = [sys.executable, "-m", "yt_dlp", "--ignore-config", "--no-playlist", "--no-cache-dir", "--no-progress", "--no-warnings", "--socket-timeout", "30", "--retries", "2", "--fragment-retries", "2", "--format", "best[ext=mp4]/best", "--output", template, "--", url]
+        env = {key: value for key, value in os.environ.items() if key.upper() != "VK_ACCESS_TOKEN"}
+        with subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=env) as process:
             while process.poll() is None:
                 if self.stop.wait(0.5):
                     process.terminate()
@@ -474,7 +562,6 @@ class Downloader:
                     if process.poll() is None:
                         process.kill()
                     raise DownloadStopped()
-            process.stdout.read()
             if process.returncode:
                 raise MediaDownloadError("yt-dlp не смог получить готовый файл видео")
         prefix = destination.stem + "."
@@ -492,22 +579,25 @@ class Downloader:
             return existing, True
         sources = self._sources(row)
         destination = self._path(row, sources[0])
-        if row.get("url"):
-            last_error = None
+        failures = []
+        for label, url in _direct_sources(row):
             for attempt in range(3):
                 _stopped(self.stop)
                 try:
-                    result = download_file(row["url"], destination, row["kind"], expected_size=row.get("expected_size", 0), expected_ext=row.get("ext") or _metadata(row).get("ext", ""), stop=self.stop, opener=self.opener)
+                    result = download_file(url, destination, row["kind"], expected_size=row.get("expected_size", 0), expected_ext=row.get("ext") or _metadata(row).get("ext", ""), stop=self.stop, opener=self.opener)
                     return result, False
                 except MediaDownloadError as exc:
-                    last_error = exc
                     if not exc.retryable or attempt == 2:
+                        failures.append((label + ": " if label else "") + str(exc))
                         break
                     if self.stop.wait(2 ** attempt):
                         raise DownloadStopped()
-            if row["kind"] != "video" or not self.use_ytdlp:
-                raise last_error
-        return self._yt_dlp(row, destination), False
+        if row["kind"] == "video" and self.use_ytdlp and _metadata(row).get("player"):
+            try:
+                return self._yt_dlp(row, destination), False
+            except MediaDownloadError as exc:
+                failures.append("Проигрыватель: " + str(exc))
+        raise MediaDownloadError("; ".join(failures) or row.get("error") or "API не вернул адрес файла")
 
     def run(self):
         summary = {"downloaded": 0, "reused": 0, "failed": 0, "unavailable": 0, "partial": 0}
@@ -517,8 +607,11 @@ class Downloader:
             self.store.meta("phase", "Файлы: %s/%s — %s" % (index, len(rows), row.get("name") or row["key"]))
             if self.progress is not None:
                 self.progress(index, len(rows), row)
-            if not row.get("url") and not row.get("path") and not (self.use_ytdlp and row["kind"] == "video" and _metadata(row).get("player")):
-                self.store.mark_media_error(row["key"], "unavailable", row.get("error") or "API не вернул адрес файла")
+            if not row.get("path") and not _direct_sources(row) and not (self.use_ytdlp and row["kind"] == "video" and _metadata(row).get("player")):
+                reason = row.get("error") or "API не вернул адрес файла"
+                if row["kind"] == "video" and _metadata(row).get("player"):
+                    reason = "Нет прямого адреса MP4. Для попытки через проигрыватель запустите загрузчик с --yt-dlp"
+                self.store.mark_media_error(row["key"], "unavailable", reason)
                 summary["unavailable"] += 1
                 continue
             try:
@@ -532,8 +625,11 @@ class Downloader:
             except MediaDownloadError as exc:
                 self.store.mark_media_error(row["key"], "failed", str(exc))
                 summary["failed"] += 1
-            except (OSError, ValueError) as exc:
-                self.store.mark_media_error(row["key"], "failed", "Не удалось сохранить файл: " + type(exc).__name__)
+            except OSError as exc:
+                self.store.mark_media_error(row["key"], "failed", str(_write_error(exc)))
+                summary["failed"] += 1
+            except ValueError:
+                self.store.mark_media_error(row["key"], "failed", "Некорректный адрес или параметры файла")
                 summary["failed"] += 1
         return summary
 

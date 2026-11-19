@@ -1,12 +1,16 @@
 import base64
 import hashlib
+import http.client
 import io
 import json
 import os
 import re
+import socket
+import ssl
 import tempfile
 import threading
 import unittest
+import urllib.error
 from email.message import Message
 from pathlib import Path, PureWindowsPath
 from unittest import mock
@@ -119,6 +123,50 @@ class DirectDownloadTests(unittest.TestCase):
         for response in (Response(b'{"error":"expired"}', "application/json"), Response(b"#EXTM3U\nhttps://cdn.example.test/segment.ts", "application/octet-stream")):
             with self.subTest(response=response), self.assertRaises(media.MediaDownloadError):
                 self.download(response)
+
+    def test_video_download_rejects_an_image_under_mp4_url(self):
+        with self.assertRaisesRegex(media.MediaDownloadError, "другого типа"):
+            self.download(Response(PNG), kind="video", name="Video.mp4")
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_http_and_nested_network_errors_are_actionable_without_leaking_urls(self):
+        private_url = "https://cdn.example.test/file?token=PRIVATE"
+        cases = (
+            (urllib.error.HTTPError(private_url, 403, private_url, {}, None), "HTTP 403.*--refresh", False),
+            (urllib.error.URLError(ssl.SSLCertVerificationError(1, private_url)), "сертификат HTTPS", False),
+            (urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, private_url)), "DNS", True),
+            (urllib.error.URLError(TimeoutError(private_url)), "время ожидания", True),
+            (urllib.error.URLError(OSError("Tunnel connection failed: 407 " + private_url)), "Прокси.*HTTP 407", False),
+            (http.client.IncompleteRead(private_url.encode()), "полного файла", True),
+        )
+        for error, message, retry in cases:
+            with self.subTest(error=type(error).__name__):
+                opener = mock.Mock()
+                opener.open.side_effect = error
+                with self.assertRaisesRegex(media.MediaDownloadError, message) as raised:
+                    media.download_file(private_url, self.root / "Video.mp4", "video", opener=opener)
+                self.assertEqual(raised.exception.retryable, retry)
+                self.assertNotIn("PRIVATE", str(raised.exception))
+                self.assertNotIn("cdn.example.test", str(raised.exception))
+
+    def test_truncated_network_stream_leaves_no_file(self):
+        class TruncatedResponse(Response):
+            def read(self, size):
+                if size == 8192:
+                    return super().read(size)
+                raise http.client.IncompleteRead(b"partial")
+
+        with self.assertRaisesRegex(media.MediaDownloadError, "полного файла"):
+            self.download(TruncatedResponse(PNG))
+        self.assertEqual(list(self.root.iterdir()), [])
+
+    def test_successful_partial_http_response_is_not_marked_as_complete(self):
+        response = Response(PNG)
+        response.status = 206
+        response.headers["Content-Range"] = "bytes 0-%s/%s" % (len(PNG) - 1, len(PNG) + 500)
+        with self.assertRaisesRegex(media.MediaDownloadError, "только часть файла"):
+            self.download(response)
+        self.assertEqual(list(self.root.iterdir()), [])
 
     def test_stop_leaves_no_partial_file(self):
         stop = threading.Event()
@@ -285,6 +333,51 @@ class URLValidationTests(unittest.TestCase):
         with mock.patch.object(media.socket, "getaddrinfo", return_value=[(2, 1, 6, "", ("127.0.0.1", 443))]):
             with self.assertRaises(media.MediaDownloadError):
                 media.public_https("https://example.test/a")
+
+
+class VideoRecoveryTests(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.store = Store(self.temp.name)
+        self.addCleanup(self.store.close)
+        self.worker = media.Downloader(self.store, threading.Event())
+        self.key = "video:42_3"
+        self.high = "https://example.test/high.mp4?token=PRIVATE"
+        self.low = "https://example.test/low.mp4?token=PRIVATE"
+        self.store.asset(self.key, self.high, "video", "Ролик", metadata={"files": {
+            "mp4_1080": self.high, "mp4_720": self.high, "mp4_360": self.low, "external": "https://example.test/player",
+        }})
+
+    def test_previously_failed_video_recovers_with_alternate_saved_url(self):
+        self.store.mark_media_error(self.key, "failed", "Сетевая ошибка при скачивании: URLError")
+        data = b"\x00\x00\x00\x18ftypisom\x00\x00\x00\x00isommp42"
+        def load(request, **kwargs):
+            if request.full_url == self.high:
+                raise urllib.error.HTTPError(self.high, 403, "expired", {}, None)
+            self.assertEqual(request.full_url, self.low)
+            return Response(data)
+        with mock.patch.object(media, "public_https", side_effect=lambda url: url), mock.patch.object(self.worker.opener, "open", side_effect=load) as opener:
+            summary = self.worker.run()
+            self.assertEqual(self.worker.run()["reused"], 1)
+        self.assertEqual(summary["downloaded"], 1)
+        self.assertEqual(opener.call_count, 2)
+        row = self.store.get_media(self.key)
+        self.assertEqual(row["mime"], "video/mp4")
+        self.assertEqual(row["status"], "done")
+        self.assertEqual((self.store.root / row["path"]).read_bytes(), data)
+
+    def test_all_alternates_fail_with_resolution_and_http_status(self):
+        def load(request, **kwargs):
+            status = 403 if request.full_url == self.high else 404
+            raise urllib.error.HTTPError(request.full_url, status, "unavailable", {}, None)
+        with mock.patch.object(media, "public_https", side_effect=lambda url: url), mock.patch.object(self.worker.opener, "open", side_effect=load):
+            summary = self.worker.run()
+        self.assertEqual(summary["failed"], 1)
+        error = self.store.get_media(self.key)["error"]
+        self.assertIn("1080p: Сервер файла вернул HTTP 403", error)
+        self.assertIn("360p: Сервер файла вернул HTTP 404", error)
+        self.assertNotIn("PRIVATE", error)
 
 
 if __name__ == "__main__":
