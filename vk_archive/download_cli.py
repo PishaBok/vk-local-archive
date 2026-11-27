@@ -136,12 +136,15 @@ def main(argv=None):
     parser.add_argument("--hidden-token", action="store_true", help="Скрывать ввод токена; по умолчанию используется обычный ввод")
     parser.add_argument("--debug-token", action="store_true", help="Показать длину/отпечаток токена и пропустить локальную проверку формата")
     parser.add_argument("--api-version", default="5.199")
+    parser.add_argument("--system-tls", action="store_true", help="Для прямого скачивания файлов проверять HTTPS через truststore (Python 3.10+)")
     parser.add_argument("--yt-dlp", action="store_true", help="Дополнительно попробовать скачать потоковое видео через установленный yt-dlp")
     args = parser.parse_args(argv)
     if sum((args.files_only, args.metadata_only, args.verify)) > 1:
         parser.error("Выберите один режим: --files-only, --metadata-only или --verify")
     if args.refresh and (args.files_only or args.verify):
         parser.error("--refresh используется только вместе с обходом API")
+    if args.system_tls and (args.metadata_only or args.verify):
+        parser.error("--system-tls используется только при скачивании файлов")
     if (args.files_only or args.verify) and not (Path(args.out).expanduser() / "archive.sqlite3").is_file():
         parser.error("Архив не найден. Сначала выполните обычную выгрузку или укажите --out")
     stop = threading.Event()
@@ -150,7 +153,8 @@ def main(argv=None):
     try:
         # Imports are here so the viewer has no dependency on collector startup.
         from .collector import Collector
-        from .media import Downloader, verify_files
+        from .media import Downloader, media_opener, verify_files
+        opener = media_opener(system_tls=True) if args.system_tls else None
         token = "" if args.files_only or args.verify else read_token(args.hidden_token, args.debug_token)
         store = Store(args.out, create=not args.verify)
         print("Архив: " + str(store.root), flush=True)
@@ -179,7 +183,9 @@ def main(argv=None):
                 api_ok = Collector(API(token, store, stop, args.api_version), store, stop, refresh=args.refresh).run()
             if api_ok and not stop.is_set() and not args.metadata_only:
                 store.meta("phase", "Загрузка медиафайлов")
-                Downloader(store, stop, use_ytdlp=args.yt_dlp, progress=lambda index, total, row: print("Медиа %s/%s: %s" % (index, total, row.get("name") or row["key"]), flush=True)).run()
+                def progress(index, total, row):
+                    print("Медиа %s/%s: %s" % (index, total, row.get("name") or row["key"]), flush=True)
+                Downloader(store, stop, use_ytdlp=args.yt_dlp, progress=progress, opener=opener).run()
             if stop.is_set():
                 store.meta("run_state", "interrupted")
                 store.meta("phase", "Загрузка прервана; следующий запуск продолжит работу")

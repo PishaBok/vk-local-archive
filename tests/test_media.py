@@ -7,8 +7,10 @@ import os
 import re
 import socket
 import ssl
+import sys
 import tempfile
 import threading
+import types
 import unittest
 import urllib.error
 from email.message import Message
@@ -131,9 +133,17 @@ class DirectDownloadTests(unittest.TestCase):
 
     def test_http_and_nested_network_errors_are_actionable_without_leaking_urls(self):
         private_url = "https://cdn.example.test/file?token=PRIVATE"
+        openssl_failure = ssl.SSLCertVerificationError(1, private_url)
+        openssl_failure.verify_code = 20
+        openssl_failure.verify_message = private_url
+        windows_failure = ssl.SSLCertVerificationError(private_url)
+        windows_failure.verify_code = 0x800B0109
+        windows_failure.verify_message = private_url
         cases = (
             (urllib.error.HTTPError(private_url, 403, private_url, {}, None), "HTTP 403.*--refresh", False),
             (urllib.error.URLError(ssl.SSLCertVerificationError(1, private_url)), "сертификат HTTPS", False),
+            (urllib.error.URLError(openssl_failure), "код 20.*доверенную цепочку", False),
+            (urllib.error.URLError(windows_failure), "код 0x800B0109.*корневому сертификату", False),
             (urllib.error.URLError(socket.gaierror(socket.EAI_AGAIN, private_url)), "DNS", True),
             (urllib.error.URLError(TimeoutError(private_url)), "время ожидания", True),
             (urllib.error.URLError(OSError("Tunnel connection failed: 407 " + private_url)), "Прокси.*HTTP 407", False),
@@ -148,6 +158,16 @@ class DirectDownloadTests(unittest.TestCase):
                 self.assertEqual(raised.exception.retryable, retry)
                 self.assertNotIn("PRIVATE", str(raised.exception))
                 self.assertNotIn("cdn.example.test", str(raised.exception))
+
+    def test_system_tls_uses_a_verified_context_and_keeps_redirect_checks(self):
+        truststore = types.SimpleNamespace(SSLContext=mock.Mock(side_effect=ssl.SSLContext))
+        with mock.patch.dict(sys.modules, {"truststore": truststore}):
+            opener = media.media_opener(system_tls=True)
+        truststore.SSLContext.assert_called_once_with(ssl.PROTOCOL_TLS_CLIENT)
+        handler = next(handler for handler in opener.handlers if isinstance(handler, media.urllib.request.HTTPSHandler))
+        self.assertTrue(handler._context.check_hostname)
+        self.assertEqual(handler._context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(any(isinstance(handler, media.SafeRedirect) for handler in opener.handlers))
 
     def test_truncated_network_stream_leaves_no_file(self):
         class TruncatedResponse(Response):

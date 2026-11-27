@@ -59,6 +59,20 @@ MIME_EXTENSIONS = {
     "video/quicktime": ".mov", "video/x-matroska": ".mkv",
     "video/mp2t": ".ts", "application/pdf": ".pdf",
 }
+# OpenSSL X509 verification codes and Windows certificate policy HRESULTs.
+CERTIFICATE_ERRORS = {
+    9: "сертификат ещё не действует; проверьте дату и время системы",
+    10: "срок действия сертификата истёк; проверьте дату и время системы",
+    18: "сервер предъявил недоверенный самоподписанный сертификат",
+    20: "не удалось построить доверенную цепочку сертификатов",
+    21: "не удалось построить доверенную цепочку сертификатов",
+    62: "имя сервера не совпадает с сертификатом",
+    64: "IP-адрес сервера не совпадает с сертификатом",
+    0x800B0101: "сертификат вне срока действия; проверьте дату и время системы",
+    0x800B0109: "Windows не доверяет корневому сертификату",
+    0x800B010A: "Windows не удалось построить цепочку сертификатов",
+    0x800B010F: "имя сервера не совпадает с сертификатом",
+}
 
 
 def _trim_units(value: str, units: int, byte_limit: int = 220) -> str:
@@ -219,7 +233,13 @@ def _network_error(error: Exception) -> MediaDownloadError:
     """Classify urllib failures without exposing URLs, credentials or raw errors."""
     reason = error.reason if isinstance(error, urllib.error.URLError) else error
     if isinstance(reason, ssl.SSLCertVerificationError):
-        return MediaDownloadError("Не удалось проверить сертификат HTTPS (TLS); проверьте дату системы и доверенные сертификаты")
+        message = "Не удалось проверить сертификат HTTPS (TLS)"
+        code = getattr(reason, "verify_code", None)
+        if isinstance(code, int):
+            shown_code = f"0x{code:08X}" if code >= 0x80000000 else str(code)
+            message += f", код {shown_code}"
+        detail = CERTIFICATE_ERRORS.get(code, "проверьте дату системы и доверенные сертификаты")
+        return MediaDownloadError(f"{message}: {detail}")
     if isinstance(reason, ssl.SSLEOFError):
         return MediaDownloadError("Сервер закрыл TLS-соединение до завершения загрузки", retryable=True)
     if isinstance(reason, ssl.SSLError):
@@ -267,6 +287,20 @@ class SafeRedirect(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         public_https(newurl)
         return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def media_opener(*, system_tls: bool = False):
+    if not system_tls:
+        return urllib.request.build_opener(SafeRedirect())
+    try:
+        import truststore
+    except ModuleNotFoundError:
+        raise RuntimeError("Для --system-tls установите truststore в Python 3.10 или новее (python -m pip install truststore)") from None
+    except ImportError:
+        raise RuntimeError("Системная проверка TLS через truststore недоступна в этой версии ОС или Python") from None
+    context = truststore.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.set_alpn_protocols(["http/1.1"])
+    return urllib.request.build_opener(SafeRedirect(), urllib.request.HTTPSHandler(context=context))
 
 
 def _sniff_mime(head: bytes, reported: str, kind: str) -> str:
@@ -333,7 +367,7 @@ def download_file(url: str, destination: Path, kind: str, *, expected_size: int 
     public_https(url)
     destination = Path(destination)
     destination.parent.mkdir(parents=True, exist_ok=True)
-    opener = opener or urllib.request.build_opener(SafeRedirect())
+    opener = opener or media_opener()
     request = urllib.request.Request(url, headers={"User-Agent": "VKArchive/2"})
     temp = None
     try:
@@ -478,10 +512,10 @@ def _write_error(error):
 
 class Downloader:
     """Download collected assets, then materialize every readable source path."""
-    def __init__(self, store, stop, use_ytdlp: bool = False, progress=None):
+    def __init__(self, store, stop, use_ytdlp: bool = False, progress=None, *, opener=None):
         self.store, self.stop, self.use_ytdlp = store, stop, use_ytdlp
         self.progress = progress
-        self.opener = urllib.request.build_opener(SafeRedirect())
+        self.opener = opener or media_opener()
 
     def _sources(self, row):
         sources = self.store.media_sources(row["key"])

@@ -167,6 +167,17 @@ class CommandTests(unittest.TestCase):
         report = json.loads((self.root / "report.json").read_text(encoding="utf-8"))
         self.assertEqual(report["meta"]["run_state"], "interrupted")
 
+    def test_files_only_passes_system_tls_opener_to_downloader(self):
+        store = Store(self.root)
+        store.meta("owner_id", 42)
+        store.close()
+        with mock.patch("vk_archive.media.media_opener") as opener, mock.patch("vk_archive.media.Downloader") as downloader, mock.patch.object(download_cli, "read_token") as prompt:
+            self.assertEqual(self.run_download(["--files-only", "--system-tls"]), 0)
+        opener.assert_called_once_with(system_tls=True)
+        self.assertIs(downloader.call_args.kwargs["opener"], opener.return_value)
+        downloader.return_value.run.assert_called_once_with()
+        prompt.assert_not_called()
+
     def test_visible_input_and_debug_do_not_print_token(self):
         output = io.StringIO()
         with mock.patch.dict(os.environ, {}, clear=True), mock.patch("builtins.input", return_value=" FAKE\x16TOKEN "), contextlib.redirect_stdout(output):
